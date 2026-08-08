@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idor-auto"
+version = "2.0.0"
+description = "Differential IDOR / BOLA access-control tester"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "CypherNova1337" }]
+keywords = ["idor", "bola", "security", "pentest", "bug-bounty", "access-control"]
+dependencies = ["requests>=2.28"]
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/CypherNova1337/IDOR-Auto"
+
+[project.scripts]
+auto-idor = "auto_idor.cli:main"
+
+[tool.setuptools]
+packages = ["auto_idor"]

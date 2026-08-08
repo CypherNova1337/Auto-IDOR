@@ -1,0 +1,38 @@
+{
+  "base_url": "https://api.example.com",
+  "proxy": null,
+  "identities": [
+    {
+      "name": "alice",
+      "headers": { "Authorization": "Bearer ALICE_TOKEN", "Content-Type": "application/json" },
+      "owns": ["a1b2c3", "d4e5f6"]
+    },
+    {
+      "name": "bob",
+      "headers": { "Authorization": "Bearer BOB_TOKEN", "Content-Type": "application/json" },
+      "owns": ["9f8e7d"]
+    }
+  ],
+  "rules": [
+    {
+      "name": "graphql-node-by-id",
+      "request": {
+        "method": "POST",
+        "path": "/graphql",
+        "json": {
+          "query": "query($id: ID!){ node(id:$id){ ... on Document { id title body owner { email } } } }",
+          "variables": { "id": "{id}" }
+        }
+      },
+      "encodings": ["raw", "base64"]
+    },
+    {
+      "name": "download-attachment",
+      "request": {
+        "method": "GET",
+        "path": "/api/v2/attachments/{id}/download"
+      },
+      "method_tamper": ["POST"]
+    }
+  ]
+}
