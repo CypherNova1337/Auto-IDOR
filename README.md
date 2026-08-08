@@ -1,158 +1,275 @@
 # IDOR-Auto
 
-IDOR-Auto is a command-line tool written in Bash that helps automate the process of finding basic Insecure Direct Object Reference (IDOR) vulnerabilities in web applications by checking HTTP status codes for URLs constructed from a base URL and a wordlist. The tool is designed for bug bounty hunters and penetration testers as a starting point for identifying potential IDOR vulnerabilities.
+**IDOR-Auto** is an access-control testing tool for finding IDOR / BOLA
+(Broken Object-Level Authorization) vulnerabilities — including the complex ones
+that status-code scanners miss.
 
-## Features
+It does **not** guess vulnerabilities from HTTP status codes. Instead it performs
+**differential access testing**: it drives several distinct identities against the
+same objects and proves whether one identity can obtain another's data. A finding
+means *"user A read user B's object"*, not *"the endpoint returned 200"*.
 
-* Automated potential IDOR checking using a custom wordlist.
-* Supports multiple HTTP methods (GET, POST, PUT, DELETE).
-* **Interactive Mode:** Pauses after each request attempt for review (default behavior).
-* **Non-Interactive Mode:** Runs continuously through the wordlist.
-* Option to save successful (HTTP 200) results to a file.
-* Lightweight and easy to use Bash script.
+> For authorized security testing only — pentests, bug bounty within scope, and
+> your own applications. See [Disclaimer](#disclaimer).
 
-## Prerequisites
+---
 
-Before you begin, ensure you have the following installed:
+## Why this is different from a status-code scanner
 
-* **Bash:** A Unix shell and command language (usually pre-installed on Linux and macOS).
-* **`curl`:** A command-line tool for transferring data with URLs.
-* **`git`:** A distributed version control system (for cloning the repository).
+The classic approach ("append an id, flag every `200`") drowns you in false
+positives: plenty of endpoints legitimately return `200`. IDOR-Auto reasons about
+*access* using three reference responses for every object id:
+
+| Reference | Meaning |
+|-----------|---------|
+| **owner** | the victim identity reading *its own* object — the authorized truth |
+| **attacker** | another identity trying to read the victim's object — the test |
+| **denied** | the anonymous baseline — what *properly refused* looks like |
+
+An IDOR is reported only when the **attacker's response matches the owner's and
+differs from the denied baseline**. If the attacker gets the same thing an
+anonymous user gets, the endpoint is simply *public* — reported as
+`not-vulnerable`, not as a false alarm.
+
+On top of that it understands the parts of real IDORs that trip up naive tools:
+
+- **Canary / secret oracle** — the strongest signal. Tell it a string that is
+  private to a victim (email, account name, API key). If that value ever appears
+  in another identity's response, it's a confirmed leak (HIGH confidence),
+  regardless of body similarity.
+- **Injection anywhere** — the id can live in the URL path, a query parameter, a
+  request header, a cookie, or anywhere inside a JSON / form body (any depth).
+- **Wrapped / obfuscated ids** — try the same logical id `raw`, `base64`,
+  `base64url`, `hex`, or URL-encoded so you reach references the app expects
+  encoded.
+- **Method tampering** — replay the same request under other HTTP methods.
+- **Raw request import** — paste a request straight from Burp; IDOR-Auto parses
+  it and auto-locates the identifier to attack.
+- **Identifier detection** — classifies values (int / uuid / objectid / hex /
+  base64 / jwt) and ranks which are worth attacking.
+
+---
 
 ## Installation
 
-1.  Clone the repository from GitHub:
-    ```bash
-    git clone https://github.com/CypherNova1337/IDOR-Auto.git
-    ```
-2.  Navigate into the cloned directory:
-    ```bash
-    cd IDOR-Auto
-    ```
-3.  Make the script executable:
-    ```bash
-    chmod +x IDOR-Auto.sh
-    ```
-
-## Usage
-
-Run the script from your terminal using command-line flags to specify the target and options.
-
-### Syntax
+Requires Python 3.8+.
 
 ```bash
-./IDOR-Auto.sh -u <target_url> -w <wordlist> -m <http_method> [options]
+git clone https://github.com/CypherNova1337/IDOR-Auto.git
+cd IDOR-Auto
+pip install -r requirements.txt        # requests (+ PyYAML for YAML configs)
 ```
 
-Arguments
+Optionally install it as a command:
 
-  -u <target_url>: (Required) The base URL for testing. The script will append each line from the wordlist to this URL.
-        Example: If -u https://example.com/api/v1/users/ is provided, and the wordlist contains 123, the script tests https://example.com/api/v1/users/123.
-        
-  -w <wordlist>: (Required) Path to the file containing potential object identifiers (e.g., numbers, UUIDs, usernames), one per line.
-        Example ids.txt:
+```bash
+pip install .          # provides the `auto-idor` command
+```
 
-        1
-        2
-        admin
-        101
-        guest
+Everywhere below, `auto-idor` and `python3 -m auto_idor` are interchangeable.
 
-  
-  -m <http_method>: (Required) The HTTP method to use (e.g., GET, POST, PUT, DELETE).
-  
-  -o <output_file>: (Optional) File path to save results. Only successful findings (HTTP 200 status code) will be appended to this file.
-  
-  -i <true|false>: (Optional) Controls the execution mode.
-      -i true (Default if flag is omitted): Interactive Mode. The script pauses after each URL check, prompts for Enter key press to continue, and displays the status code for all attempts ([+] for 200, [-] for others).
-      -i false: Non-Interactive Mode. The script runs continuously through the entire wordlist without pausing. It only prints successful (HTTP 200) results ([+]) to the console.
-    
-  -h: Display this help menu and exit.
+---
 
-Examples
+## Quick start
 
-  Basic Interactive Scan using GET:
+### 1. Ad-hoc test between two users
 
-./IDOR-Auto.sh -u https://api.example.com/items/ -w item_ids.txt -m GET
+Give each user their auth and the ids they legitimately own. `{id}` marks where
+the object reference goes.
 
-(This runs interactively, pausing after each check)
+```bash
+auto-idor quick \
+  -u https://api.example.com/api/v1/invoices/{id} \
+  --token-a "ALICE_JWT" --owns-a 1001,1002 --secret-a "alice@corp.example" \
+  --token-b "BOB_JWT"   --owns-b 2001,2002 --secret-b "bob@corp.example"
+```
 
-Non-Interactive POST Scan, Saving Successes:
+Example output:
 
+```
+[VULNERABLE/HIGH] quick: user-a -> user-b's id=2001 [GET]  attacker=200 owner=200 anon=401
+        victim's private data leaked to attacker: 'bob@corp.example'
+        leaked canary: 'bob@corp.example'
+```
 
-./IDOR-Auto.sh -u https://api.example.com/profiles/ -w usernames.txt -m POST -o successful_posts.txt -i false
+Non-bearer auth? Use `-H/--header-a`, `--cookie-a` (and the `-b` equivalents):
 
-(This runs without pausing and saves only HTTP 200 results to successful_posts.txt)
+```bash
+auto-idor quick -u https://api/doc/{id} \
+  -H "X-Api-Key: AAA" --cookie-a "session=xxx" --owns-a 10,11 \
+  --header-b "X-Api-Key: BBB" --cookie-b "session=yyy" --owns-b 20,21
+```
 
-Interactive PUT Scan:
+### 2. From a raw Burp request
 
-  ./IDOR-Auto.sh -u https://api.internal/resource/ -w resource_ids.txt -m PUT -i true
+Save the request to a file (Burp → *Copy to file*), then:
 
-## How it Works & Disclaimer
+```bash
+# See what IDOR-Auto would attack:
+auto-idor detect -r request.txt
 
+# Run it (auto-marks the best identifier, or pin one with --mark):
+auto-idor quick -r request.txt --mark 2001 \
+  --token-a ALICE --owns-a 1001 --token-b BOB --owns-b 2001
+```
 
+`detect` output:
 
- **Here's a more detailed breakdown of what the script does:**
+```
+[*] GET https://api.example.com/api/v1/invoices/2001?ref=abc123def456
+[*] 2 identifier candidate(s), best first:
 
-  Argument Parsing:
-      The script uses the built-in Bash command getopts to parse the command-line flags (-u, -w, -m, -o, -i, -h) you provide.
-      It assigns the values you pass (like the URL, wordlist path, etc.) to internal variables.
-      It checks if the required arguments (-u, -w, -m) were provided. If not, it prints an error, shows the help menu, and exits.
+    query[ref] = 'abc123def456' (hex, score 0.95)
+    path[3] = '2001' (int, score 0.65)
+```
 
-  Reading the Wordlist:
-      The script reads the file specified by the -w flag line by line using a while IFS= read -r line loop. This method ensures each line is read exactly as it appears, including potential leading/trailing whitespace if not handled otherwise (though typically IDs don't have this issue).
+### 3. Full scan from a config file
 
-  URL Construction:
-      Inside the loop, for each line read from the wordlist, it constructs the full URL to test by simply appending the line to the base URL provided via the -u flag (full_url="${url}/${line}").
+For complex targets (nested body ids, multiple endpoints, many identities), use a
+config. Generate a starter:
 
-  Making the HTTP Request:
-      The core of the testing is done using the curl command:
-      
-  response=$(curl -s -o /dev/null -w "%{http_code}" -X ${method} ${full_url})
+```bash
+auto-idor init idor.yaml     # writes a commented example
+auto-idor run -c idor.yaml
+```
 
-   -s: Runs curl in silent mode (no progress bars).
-   
-   -o /dev/null: Discards the actual response body (the HTML, JSON, etc.). We only need the status code for this basic check.
-   
-   -w "%{http_code}": This is the key part – it tells curl to output only the HTTP status code (like 200, 404, 403, etc.) after the request completes. This output is captured into the response variable.
-   
-   -X ${method}: Sets the HTTP method (GET, POST, etc.) based on the value you provided with the -m flag.
-   
-   ${full_url}: The complete URL being tested in the current loop iteration.
+---
 
-Analyzing the Response:
+## Config reference
 
-  The script checks the value stored in the response variable (which contains the HTTP status code):
-  
-  if [[ ${response} -eq 200 ]]; then ... else ... fi
+YAML (needs PyYAML) or JSON — both accepted. See [`examples/`](examples/).
 
-  If the status code is exactly 200, it's considered a potential finding.
+```yaml
+base_url: https://api.example.com
 
-  Output and File Saving:
-        Success (HTTP 200):
-            It prints a line to the console starting with [+] Potential IDOR vulnerability found:, followed by the URL and status code.
-            If you specified an output file using -o <output_file>, it appends the URL and status code (${full_url} (HTTP ${response})) to that file.
-        Other Status Codes (Non-200):
-            These results ([-] ${full_url} (HTTP ${response})) are only printed to the console if the script is running in Interactive Mode (-i true, which is the default). Non-interactive mode skips printing these.
+# transport (all optional)
+threads: 8                 # concurrent workers
+timeout: 15                # per-request seconds
+delay: 0.0                 # throttle: seconds between requests per worker
+verify_tls: true
+# proxy: http://127.0.0.1:8080     # route through Burp / mitmproxy
+include_anonymous: true            # add the no-auth "denied" baseline
+# high_threshold: 0.95             # similarity to call it the same object
+# medium_threshold: 0.6
 
-  Interactive vs. Non-Interactive Execution:
-        The main difference lies in the scan_idor_interactive function versus scan_idor_non_interactive.
-        Interactive: Contains read -p "Press Enter to continue..." inside the loop, causing the script to pause after every single request until you press Enter. It also prints results for all status codes.
-        Non-Interactive: Omits the read command and the else block for printing non-200 results, allowing it to cycle through the entire wordlist without stopping and only showing successes.
+identities:
+  - name: alice
+    headers:
+      Authorization: "Bearer ALICE_TOKEN"
+    cookies:
+      session: alices-cookie
+    owns: [1001, 1002]                       # ids alice legitimately owns
+    secrets: ["alice@corp.example"]          # canaries private to alice
+  - name: bob
+    headers:
+      Authorization: "Bearer BOB_TOKEN"
+    owns: [2001, 2002]
+    secrets: ["bob@corp.example"]
 
-Disclaimer
+rules:
+  # Path-based reference.
+  - name: get-invoice
+    request:
+      method: GET
+      path: /api/v1/invoices/{id}
 
-Important: An HTTP 200 response simply indicates the URL was accessible and returned a success code. It does NOT automatically confirm a security vulnerability. Many endpoints will correctly return 200 for valid object IDs that you are supposed to access.  
+  # Id nested in a JSON body, base64-wrapped, also replayed as GET.
+  - name: order-detail
+    request:
+      method: POST
+      path: /api/v1/orders/detail
+      headers:
+        Content-Type: application/json
+      json:
+        filter:
+          orderId: "{id}"
+    encodings: [raw, base64]
+    method_tamper: [GET]
+```
 
-Results from this tool must be manually verified (e.g., by visiting the URL in a browser, examining the response in a tool like Burp Suite) to determine if access to the object should have been permitted. Check if you are accessing resources belonging to other users or sensitive data that your account should not have access to. This tool is a basic endpoint discovery and status checker; treat its findings as leads for further investigation, not confirmed vulnerabilities. It may produce many false positives depending on the target application.
-Contributing
+**How the matrix is built:** for every rule, each identity's `owns` ids are read
+by that identity (owner baseline) and by the anonymous baseline, then every *other*
+identity attempts to read them. Baselines are fetched once and cached.
 
-If you find a bug, have suggestions for improvement, or want to contribute to the project, please feel free to open an issue or submit a pull request on the project's GitHub page: https://github.com/CypherNova1337/IDOR-Auto  
+> **YAML tip:** write `path: /api/v1/invoices/{id}` in block style (its own line).
+> Inside a flow mapping `{ ... }`, quote it: `path: "/api/v1/invoices/{id}"`.
 
-License
+### Request fields
 
-IDOR-Auto is licensed under the MIT license. See the LICENSE file for more information.  
+| Field | Purpose |
+|-------|---------|
+| `method` | HTTP method |
+| `path` | URL path (absolute `http…` URLs also allowed); may contain `{id}` |
+| `query` | query params (values may contain `{id}`) |
+| `headers` | per-request headers (values may contain `{id}`) |
+| `cookies` | per-request cookies |
+| `json` | JSON body; `{id}` may appear at any depth |
+| `form` | `application/x-www-form-urlencoded` body |
+| `body` | raw request body string |
 
+### Rule options
 
-This expanded section provides much more detail on the script's internal workings, which should make it clearer how the tool operates from start to finish.
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `id_token` | `{id}` | placeholder substituted with the object id |
+| `encodings` | `[raw]` | any of `raw, base64, base64url, hex, urlencode, double-urlencode` |
+| `method_tamper` | `[]` | extra methods to replay the same request with |
+| `extra_ids` | `[]` | rule-level ids to test in addition to each victim's `owns` |
 
+---
+
+## Reading the results
+
+Each result line reports a verdict and confidence:
+
+- **`VULNERABLE`** — the attacker obtained the victim's object (canary leak, or
+  body matches the owner and differs from the denied baseline).
+- **`SUSPICIOUS`** — the attacker got a success but the content only partially
+  matches; verify manually.
+- **`not-vulnerable`** — properly denied, or the endpoint is public.
+- **`inconclusive`** — the owner couldn't read its own object, so no baseline.
+
+By default only `VULNERABLE` / `SUSPICIOUS` are printed; add `--all` to see
+everything. `-o findings.json` writes structured results (with per-comparison
+similarity scores and any leaked canaries) for triage or CI. The process exits
+`2` when anything needs a human's attention, `0` otherwise.
+
+### Common flags
+
+```
+--threads N            concurrent workers (default 8)
+--delay S              seconds between requests per worker (throttle)
+--timeout S            per-request timeout
+--proxy URL            route through Burp/mitmproxy (http://127.0.0.1:8080)
+--insecure             skip TLS verification
+--follow-redirects     follow redirects
+--no-anonymous         omit the anonymous baseline
+-o, --output FILE      write findings as JSON
+--all                  also show not-vulnerable / inconclusive
+-q, --quiet            suppress progress
+```
+
+---
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+The suite covers the oracle's verdicts, identifier detection, raw-request
+parsing, and an end-to-end scan against an in-process mock API (no network
+required).
+
+---
+
+## Disclaimer
+
+This tool sends unauthorized-access *attempts* by design. Only run it against
+systems you own or are explicitly authorized to test. A `VULNERABLE` verdict is a
+strong, evidence-backed lead — confirm the impact (what data was exposed, to whom)
+before reporting. The authors accept no liability for misuse.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

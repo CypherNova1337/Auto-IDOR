@@ -1,0 +1,20 @@
+# Two authenticated users, one path-based endpoint. IDOR-Auto verifies whether
+# alice can read bob's invoices and vice-versa, using each user's own read and
+# the anonymous baseline as oracles.
+base_url: https://api.example.com
+
+identities:
+  - name: alice
+    headers:
+      Authorization: "Bearer ALICE_TOKEN"
+    owns: [1001, 1002, 1003]
+  - name: bob
+    headers:
+      Authorization: "Bearer BOB_TOKEN"
+    owns: [2001, 2002]
+
+rules:
+  - name: get-invoice
+    request:
+      method: GET
+      path: /api/v1/invoices/{id}
