@@ -1,274 +1,150 @@
-# IDOR-Auto
+# Auto-IDOR
 
-**IDOR-Auto** is an access-control testing tool for finding IDOR / BOLA
-(Broken Object-Level Authorization) vulnerabilities — including the complex ones
-that status-code scanners miss.
+Proves one user can read another user's data — instead of guessing from status codes.
 
-It does **not** guess vulnerabilities from HTTP status codes. Instead it performs
-**differential access testing**: it drives several distinct identities against the
-same objects and proves whether one identity can obtain another's data. A finding
-means *"user A read user B's object"*, not *"the endpoint returned 200"*.
+![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![python](https://img.shields.io/badge/python-3.8%2B-3776AB?style=flat-square)
 
-> For authorized security testing only — pentests, bug bounty within scope, and
-> your own applications. See [Disclaimer](#disclaimer).
+## What it does
 
----
+An application shows you your own invoice at:
 
-## Why this is different from a status-code scanner
-
-The classic approach ("append an id, flag every `200`") drowns you in false
-positives: plenty of endpoints legitimately return `200`. IDOR-Auto reasons about
-*access* using three reference responses for every object id:
-
-| Reference | Meaning |
-|-----------|---------|
-| **owner** | the victim identity reading *its own* object — the authorized truth |
-| **attacker** | another identity trying to read the victim's object — the test |
-| **denied** | the anonymous baseline — what *properly refused* looks like |
-
-An IDOR is reported only when the **attacker's response matches the owner's and
-differs from the denied baseline**. If the attacker gets the same thing an
-anonymous user gets, the endpoint is simply *public* — reported as
-`not-vulnerable`, not as a false alarm.
-
-On top of that it understands the parts of real IDORs that trip up naive tools:
-
-- **Canary / secret oracle** — the strongest signal. Tell it a string that is
-  private to a victim (email, account name, API key). If that value ever appears
-  in another identity's response, it's a confirmed leak (HIGH confidence),
-  regardless of body similarity.
-- **Injection anywhere** — the id can live in the URL path, a query parameter, a
-  request header, a cookie, or anywhere inside a JSON / form body (any depth).
-- **Wrapped / obfuscated ids** — try the same logical id `raw`, `base64`,
-  `base64url`, `hex`, or URL-encoded so you reach references the app expects
-  encoded.
-- **Method tampering** — replay the same request under other HTTP methods.
-- **Raw request import** — paste a request straight from Burp; IDOR-Auto parses
-  it and auto-locates the identifier to attack.
-- **Identifier detection** — classifies values (int / uuid / objectid / hex /
-  base64 / jwt) and ranks which are worth attacking.
-
----
-
-## Installation
-
-Requires Python 3.8+.
-
-```bash
-git clone https://github.com/CypherNova1337/IDOR-Auto.git
-cd IDOR-Auto
-pip install -r requirements.txt        # requests (+ PyYAML for YAML configs)
+```
+https://app.example/api/invoices/1042
 ```
 
-Optionally install it as a command:
+Change `1042` to `1041` and you might get somebody else's. That's IDOR — broken
+object-level authorisation — and it's one of the most common serious bugs on the
+web, because the check that should say "is this yours?" is easy to forget on one
+endpoint out of two hundred.
+
+The usual way to test it is to swap the number and look at the status code. That
+approach produces two kinds of wrong answer. A `200` that returns an empty
+object isn't a bug. A `403` for an id that doesn't exist isn't proof the check
+works. Status codes describe the response, not who was allowed to see what.
+
+Auto-IDOR tests it differently. You give it two real accounts. It logs in as
+both, asks each of them for objects belonging to the other, and compares what
+comes back against what each user legitimately sees. A finding means **user A
+received user B's data** — the actual content, confirmed — rather than "an
+endpoint returned 200."
+
+## Why you'd use it
+
+- **Findings are provable.** Each one is a comparison between two identities, so
+  the report writes itself and a triager can reproduce it.
+- **Fewer false positives**, because it never infers authorisation from a status
+  code.
+- **Checks the anonymous case too** — sometimes the endpoint needs no session at
+  all.
+- **Takes a raw Burp request**, so you can test the exact call you just watched
+  the app make.
+- **Tries encodings and method changes**, catching checks that are enforced on
+  `GET` but not `PUT`, or bypassed by a URL-encoded id.
+
+## Install
 
 ```bash
-pip install .          # provides the `auto-idor` command
+git clone https://github.com/CypherNova1337/Auto-IDOR
+cd Auto-IDOR
+pip install -r requirements.txt
+pip install .
 ```
 
-Everywhere below, `auto-idor` and `python3 -m auto_idor` are interchangeable.
+Needs Python 3.8 or newer.
 
----
+## Usage
 
-## Quick start
-
-### 1. Ad-hoc test between two users
-
-Give each user their auth and the ids they legitimately own. `{id}` marks where
-the object reference goes.
+Start with two accounts and one endpoint:
 
 ```bash
 auto-idor quick \
-  -u https://api.example.com/api/v1/invoices/{id} \
-  --token-a "ALICE_JWT" --owns-a 1001,1002 --secret-a "alice@corp.example" \
-  --token-b "BOB_JWT"   --owns-b 2001,2002 --secret-b "bob@corp.example"
+  -u 'https://app.example/api/invoices/{id}' \
+  --token-a "$USER_A_JWT" --token-b "$USER_B_JWT" \
+  --owns-a 1041,1042 --owns-b 2001,2002
 ```
 
-Example output:
+`{id}` is the slot it swaps. `--owns-a` and `--owns-b` say which ids each user
+legitimately owns, which is what lets it tell a real crossover from a normal
+response.
 
-```
-[VULNERABLE/HIGH] quick: user-a -> user-b's id=2001 [GET]  attacker=200 owner=200 anon=401
-        victim's private data leaked to attacker: 'bob@corp.example'
-        leaked canary: 'bob@corp.example'
-```
-
-Non-bearer auth? Use `-H/--header-a`, `--cookie-a` (and the `-b` equivalents):
+**Test a request you captured in Burp**
 
 ```bash
-auto-idor quick -u https://api/doc/{id} \
-  -H "X-Api-Key: AAA" --cookie-a "session=xxx" --owns-a 10,11 \
-  --header-b "X-Api-Key: BBB" --cookie-b "session=yyy" --owns-b 20,21
+auto-idor quick -r request.txt --mark 1042 \
+  --cookie-a 'session=aaa' --cookie-b 'session=bbb'
 ```
 
-### 2. From a raw Burp request
+`--mark` is the value in the saved request to treat as the id.
 
-Save the request to a file (Burp → *Copy to file*), then:
+**Find the injectable ids in a request first**
 
 ```bash
-# See what IDOR-Auto would attack:
 auto-idor detect -r request.txt
-
-# Run it (auto-marks the best identifier, or pin one with --mark):
-auto-idor quick -r request.txt --mark 2001 \
-  --token-a ALICE --owns-a 1001 --token-b BOB --owns-b 2001
 ```
 
-`detect` output:
-
-```
-[*] GET https://api.example.com/api/v1/invoices/2001?ref=abc123def456
-[*] 2 identifier candidate(s), best first:
-
-    query[ref] = 'abc123def456' (hex, score 0.95)
-    path[3] = '2001' (int, score 0.65)
-```
-
-### 3. Full scan from a config file
-
-For complex targets (nested body ids, multiple endpoints, many identities), use a
-config. Generate a starter:
+**Run a full scan across many endpoints**
 
 ```bash
-auto-idor init idor.yaml     # writes a commented example
-auto-idor run -c idor.yaml
+auto-idor init > scan.yaml   # write a config to start from
+auto-idor run -c scan.yaml -o findings/
 ```
 
----
-
-## Config reference
-
-YAML (needs PyYAML) or JSON — both accepted. See [`examples/`](examples/).
-
-```yaml
-base_url: https://api.example.com
-
-# transport (all optional)
-threads: 8                 # concurrent workers
-timeout: 15                # per-request seconds
-delay: 0.0                 # throttle: seconds between requests per worker
-verify_tls: true
-# proxy: http://127.0.0.1:8080     # route through Burp / mitmproxy
-include_anonymous: true            # add the no-auth "denied" baseline
-# high_threshold: 0.95             # similarity to call it the same object
-# medium_threshold: 0.6
-
-identities:
-  - name: alice
-    headers:
-      Authorization: "Bearer ALICE_TOKEN"
-    cookies:
-      session: alices-cookie
-    owns: [1001, 1002]                       # ids alice legitimately owns
-    secrets: ["alice@corp.example"]          # canaries private to alice
-  - name: bob
-    headers:
-      Authorization: "Bearer BOB_TOKEN"
-    owns: [2001, 2002]
-    secrets: ["bob@corp.example"]
-
-rules:
-  # Path-based reference.
-  - name: get-invoice
-    request:
-      method: GET
-      path: /api/v1/invoices/{id}
-
-  # Id nested in a JSON body, base64-wrapped, also replayed as GET.
-  - name: order-detail
-    request:
-      method: POST
-      path: /api/v1/orders/detail
-      headers:
-        Content-Type: application/json
-      json:
-        filter:
-          orderId: "{id}"
-    encodings: [raw, base64]
-    method_tamper: [GET]
-```
-
-**How the matrix is built:** for every rule, each identity's `owns` ids are read
-by that identity (owner baseline) and by the anonymous baseline, then every *other*
-identity attempts to read them. Baselines are fetched once and cached.
-
-> **YAML tip:** write `path: /api/v1/invoices/{id}` in block style (its own line).
-> Inside a flow mapping `{ ... }`, quote it: `path: "/api/v1/invoices/{id}"`.
-
-### Request fields
-
-| Field | Purpose |
-|-------|---------|
-| `method` | HTTP method |
-| `path` | URL path (absolute `http…` URLs also allowed); may contain `{id}` |
-| `query` | query params (values may contain `{id}`) |
-| `headers` | per-request headers (values may contain `{id}`) |
-| `cookies` | per-request cookies |
-| `json` | JSON body; `{id}` may appear at any depth |
-| `form` | `application/x-www-form-urlencoded` body |
-| `body` | raw request body string |
-
-### Rule options
-
-| Option | Default | Purpose |
-|--------|---------|---------|
-| `id_token` | `{id}` | placeholder substituted with the object id |
-| `encodings` | `[raw]` | any of `raw, base64, base64url, hex, urlencode, double-urlencode` |
-| `method_tamper` | `[]` | extra methods to replay the same request with |
-| `extra_ids` | `[]` | rule-level ids to test in addition to each victim's `owns` |
-
----
-
-## Reading the results
-
-Each result line reports a verdict and confidence:
-
-- **`VULNERABLE`** — the attacker obtained the victim's object (canary leak, or
-  body matches the owner and differs from the denied baseline).
-- **`SUSPICIOUS`** — the attacker got a success but the content only partially
-  matches; verify manually.
-- **`not-vulnerable`** — properly denied, or the endpoint is public.
-- **`inconclusive`** — the owner couldn't read its own object, so no baseline.
-
-By default only `VULNERABLE` / `SUSPICIOUS` are printed; add `--all` to see
-everything. `-o findings.json` writes structured results (with per-comparison
-similarity scores and any leaked canaries) for triage or CI. The process exits
-`2` when anything needs a human's attention, `0` otherwise.
-
-### Common flags
-
-```
---threads N            concurrent workers (default 8)
---delay S              seconds between requests per worker (throttle)
---timeout S            per-request timeout
---proxy URL            route through Burp/mitmproxy (http://127.0.0.1:8080)
---insecure             skip TLS verification
---follow-redirects     follow redirects
---no-anonymous         omit the anonymous baseline
--o, --output FILE      write findings as JSON
---all                  also show not-vulnerable / inconclusive
--q, --quiet            suppress progress
-```
-
----
-
-## Tests
+**Send it through Burp**
 
 ```bash
-python -m unittest discover -s tests
+auto-idor run -c scan.yaml --proxy http://127.0.0.1:8080
 ```
 
-The suite covers the oracle's verdicts, identifier detection, raw-request
-parsing, and an end-to-end scan against an in-process mock API (no network
-required).
+## Commands
 
----
+| Command | What it's for |
+|---|---|
+| `quick` | Ad-hoc test of one endpoint with two identities |
+| `run` | Full scan driven by a config file |
+| `detect` | Find id-shaped values in a raw request worth testing |
+| `init` | Write an example config to start from |
 
-## Disclaimer
+### Common options
 
-This tool sends unauthorized-access *attempts* by design. Only run it against
-systems you own or are explicitly authorized to test. A `VULNERABLE` verdict is a
-strong, evidence-backed lead — confirm the impact (what data was exposed, to whom)
-before reporting. The authors accept no liability for misuse.
+| Flag | Default | What it does |
+|---|---|---|
+| `-u` | — | Target URL containing `{id}` |
+| `-r` | — | Raw HTTP request file (`-` for stdin) |
+| `--mark` | — | Value in the raw request to use as the id slot |
+| `--token-a` / `--token-b` | — | Bearer token per identity |
+| `--cookie-a` / `--cookie-b` | — | Cookies per identity (repeatable) |
+| `-H` / `--header-b` | — | Extra headers per identity (repeatable) |
+| `--owns-a` / `--owns-b` | — | Ids each user legitimately owns |
+| `--secret-a` / `--secret-b` | — | A string only that user should ever see |
+| `--encodings` | — | Encoding variants to try on the id |
+| `--method-tamper` | — | Also retry with other HTTP methods |
+| `--no-anonymous` | off | Skip the unauthenticated baseline |
+| `--threads` | `8` | Concurrent workers |
+| `--delay` | `0` | Seconds between requests per worker |
+| `--proxy` | — | Proxy URL, e.g. Burp |
+| `--all` | off | Keep going instead of stopping at the first hit |
+| `-o` | — | Output directory |
+
+## Good to know
+
+- **`--secret-a` / `--secret-b` make it much sharper.** Give it a string only
+  that user should ever see — a name, an email, an account number — and a
+  crossover becomes unambiguous rather than inferred.
+- **Two accounts are required.** With one identity there's nothing to compare
+  against, and you're back to guessing from status codes.
+- **It writes as well as reads.** With `--method-tamper` it will try `PUT` and
+  `DELETE`. Don't point that at production data you care about.
+- **Sequential ids aren't the only kind.** UUIDs can be just as vulnerable if
+  the check is missing — you just need to know a valid one, which is what
+  `--owns-b` is for.
+
+## Authorised use
+
+Only against applications you own or that are in scope for an engagement or
+bounty programme. This tool deliberately accesses one account's data using
+another's session; doing that without permission is unauthorised access, not
+testing.
 
 ## License
 
